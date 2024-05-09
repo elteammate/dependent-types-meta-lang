@@ -9,93 +9,139 @@ enum Name {
 }
 
 #[derive(Clone, PartialEq)]
-enum Term {
+enum TermI {
     Star,
-    Var { name: Name, ty: Rc<Term> },
-    Pi { abs: Rc<Term>, term: Rc<Term> },
-    Lam { body: Rc<Term>, ty: Rc<Term> },
-    App { head: Rc<Term>, app: Rc<Term> },
+    Var { name: Name },
+    Pi { abs: Rc<TermC>, term: Rc<TermC> },
+    Ann { term: Rc<TermC>, ty: Rc<TermC> },
+    App { head: Rc<TermI>, app: Rc<TermC> },
 }
 
-fn eval(env_ext: &HashMap<SmolStr, Rc<Term>>, env_int: &mut Vec<Option<Rc<Term>>>, term: Rc<Term>) -> Rc<Term> {
-    match (*term).clone() {
-        Term::Star => term,
-        Term::Var { name: Name::Free(name), .. } =>
-            env_ext.get(&name).expect("Undefined variable").clone(),
-        Term::Var { name: Name::Bound(index), .. } =>
-            if let Some(e) = env_int[env_int.len() - index - 1].clone() {
-                e
-            } else {
-                term
-            },
-        Term::Pi { abs, term } => {
-            let abs = eval(env_ext, env_int, abs);
-            let term = eval(env_ext, env_int, term);
-            Rc::new(Term::Pi { abs, term })
+#[derive(Clone, PartialEq)]
+enum TermC {
+    I(Rc<TermI>),
+    Lam { body: Rc<TermI> },
+}
+
+struct Env<'a> {
+    ext: &'a HashMap<SmolStr, Rc<TermI>>,
+    int: &'a mut Vec<Rc<TermI>>,
+}
+
+impl<'a> Env<'a> {
+    fn get(&self, name: &Name) -> Option<Rc<TermI>> {
+        match name {
+            Name::Free(name) => self.ext.get(name).cloned(),
+            Name::Bound(index) => self.int.get(self.int.len() - index - 1).cloned(),
         }
-        Term::Lam { body, ty } => {
-            let body = eval(env_ext, env_int, body);
-            env_int.push(None);
-            let res = Rc::new(Term::Lam { body, ty });
-            env_int.pop();
-            res
+    }
+}
+
+fn substitute_top(term: Rc<TermI>, sub: Rc<TermI>) -> Rc<TermI> {
+    fn substitute_c(i: usize, term: Rc<TermC>, sub: Rc<TermI>) -> Rc<TermC> {
+        match &*term {
+            TermC::I(term) => Rc::new(TermC::I(substitute_i(i, term.clone(), sub.clone()))),
+            TermC::Lam { body } => {
+                let body = substitute_i(i + 1, body.clone(), sub.clone());
+                Rc::new(TermC::Lam { body })
+            }
         }
-        Term::App { head, app } => {
-            let app = eval(env_ext, env_int, app);
-            let head = eval(env_ext, env_int, head);
-            match &*head {
-                Term::Lam { body, .. } => {
-                    env_int.push(Some(app));
-                    let res = eval(env_ext, env_int, body.clone());
-                    env_int.pop();
-                    res
+    }
+    
+    fn substitute_i(i: usize, term: Rc<TermI>, sub: Rc<TermI>) -> Rc<TermI> {
+        match &*term {
+            TermI::Star => term,
+            TermI::Var { name } => {
+                match name {
+                    Name::Free(_) => term,
+                    Name::Bound(j) => {
+                        if i == *j {
+                            sub
+                        } else if i < *j {
+                            term
+                        } else {
+                            Rc::new(TermI::Var { name: Name::Bound(j - 1) })
+                        }
+                    }
                 }
-                _ => Rc::new(Term::App { head, app }),
+            }
+            TermI::Pi { abs, term } => {
+                let abs = substitute_c(i, abs.clone(), sub.clone());
+                let term = substitute_c(i + 1, term.clone(), sub.clone());
+                Rc::new(TermI::Pi { abs, term })
+            }
+            TermI::Ann { term, ty } => {
+                let term = substitute_c(i, term.clone(), sub.clone());
+                let ty = substitute_c(i, ty.clone(), sub.clone());
+                Rc::new(TermI::Ann { term, ty })
+            }
+            TermI::App { head, app } => {
+                let head = substitute_i(i, head.clone(), sub.clone());
+                let app = substitute_c(i, app.clone(), sub.clone());
+                Rc::new(TermI::App { head, app })
+            }
+        }
+    }
+    
+    substitute_i(0, term, sub)
+}
+
+fn eval_i(env: &mut Env, term: Rc<TermI>) -> Rc<TermI> {
+    match &*term {
+        TermI::Star => term,
+        TermI::Var { name } => {
+            env.get(name).expect("Unbound Variable")
+        }
+        TermI::Pi { abs, term } => {
+            let abs = eval_c(env, abs.clone());
+            let term = eval_c(env, term.clone());
+            Rc::new(TermI::Pi { abs, term })
+        }
+        TermI::Ann { term, ty } => {
+            if let TermC::I(inferable) = &**term {
+                eval_i(env, inferable.clone())
+            } else {
+                let term = eval_c(env, term.clone());
+                let ty = eval_c(env, ty.clone());
+                Rc::new(TermI::Ann { term, ty })
+            }
+        }
+        TermI::App { app, head } => {
+            let head = eval_i(env, head.clone());
+            let app = eval_c(env, app.clone());
+            if let TermI::Ann { term, ty } = &*head {
+                match &**term {
+                    TermC::I(inferable) => {
+                        eval_i(env, Rc::new(TermI::App { head: inferable.clone(), app }))
+                    }
+                    TermC::Lam { body } => {
+                        let ty = eval_c(env, ty.clone());
+                        let TermC::I(ty) = (*ty).clone() else {
+                            panic!("Type Annotation is not a closed term");
+                        };
+                        let TermI::Pi { term: result_ty, .. } = &*ty else {
+                            panic!("Type Annotation is not a function type");
+                        };
+                        let app = Rc::new(TermI::Ann {
+                            term: app,
+                            ty: result_ty.clone(),
+                        });
+                        substitute_top(body.clone(), app)
+                    }
+                }
+            } else {
+                return Rc::new(TermI::App { app, head });
             }
         }
     }
 }
 
-fn check_types(ctx_ext: &HashMap<SmolStr, Rc<Term>>, ctx_int: &mut Vec<Rc<Term>>, term: Rc<Term>) -> Result<Rc<Term>, SmolStr> {
-    match (*term).clone() {
-        Term::Star => Ok(term),
-        Term::Var { name: Name::Free(name), ty } => {
-            let ty_ty = check_types(ctx_ext, ctx_int, ty)?;
-            if ty_ty != Rc::new(Term::Star) {
-                return Err("Type mismatch: type of type should be star".into());
-            }
-            if let Some(expected) = ctx_ext.get(&name) {
-                if expected == &ty {
-                    Ok(term)
-                } else {
-                    Err("Type mismatch".into())
-                }
-            } else {
-                Err("Undefined variable".into())
-            }
-        },
-        Term::Var { name: Name::Bound(index), ty } => {
-            if let Some(ty) = ctx_int.get(ctx_int.len() - index - 1) {
-                Ok(ty.clone())
-            } else {
-                Err("Undefined variable".into())
-            }
-        }
-            
-        Term::Pi { abs, term } => {
-            check_types(ctx_ext, ctx_int, abs)?;
-            check_types(ctx_ext, ctx_int, term)
-        }
-        Term::Lam { body, ty } => {
-            check_types(ctx_ext, ctx_int, ty)?;
-            ctx_int.push(Some(ty));
-            check_types(ctx_ext, ctx_int, body)?;
-            ctx_int.pop();
-            Ok(())
-        }
-        Term::App { head, app } => {
-            check_types(ctx_ext, ctx_int, head)?;
-            check_types(ctx_ext, ctx_int, app)
+fn eval_c(env: &mut Env, term: Rc<TermC>) -> Rc<TermC> {
+    match &*term {
+        TermC::I(term) => Rc::new(TermC::I(eval_i(env, term.clone()))),
+        TermC::Lam { body } => {
+            let body = eval_i(env, body.clone());
+            Rc::new(TermC::Lam { body })
         }
     }
 }
